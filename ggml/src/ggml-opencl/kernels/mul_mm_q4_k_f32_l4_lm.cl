@@ -3,13 +3,31 @@
 #define LOAD_VEC_A 4
 #define LOAD_VEC_B 4
 
+#ifndef BM
 #define BM 64
-#define BN 64
-#define BK 32
-#define TM 4
-#define TN 8
+#endif
 
-kernel void kernel_mul_mm_q4_k_f32_l4_lm(
+#ifndef BN
+#define BN 64
+#endif
+
+#ifndef BK
+#define BK 32
+#endif
+
+#ifndef TM
+#define TM 4
+#endif
+
+#ifndef TN
+#define TN 8
+#endif
+
+#ifndef KERNEL_NAME
+#define KERNEL_NAME kernel_mul_mm_q4_k_f32_l4_lm
+#endif
+
+kernel void KERNEL_NAME(
     global uchar4 * src0_q,
     global uchar  * src0_s,
     global half   * src0_d,

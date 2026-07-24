@@ -905,6 +905,7 @@ struct ggml_backend_opencl_context {
     cl_kernel kernel_mul_mm_q5_1_f32_l4_lm;
     cl_kernel kernel_mul_mm_q8_0_f32_l4_lm;
     cl_kernel kernel_mul_mm_q4_k_f32_l4_lm;
+    cl_kernel kernel_mul_mm_q4_k_f32_l4_lm_m32_n128;
     cl_kernel kernel_mul_mm_q5_k_f32_l4_lm;
     cl_kernel kernel_mul_mm_q6_k_f32_l4_lm;
     cl_kernel kernel_mul_mm_iq4_nl_f32_l4_lm;
@@ -2398,6 +2399,15 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
 
         CL_CHECK((backend_ctx->kernel_mul_mm_q4_k_f32_l4_lm = clCreateKernel(prog, "kernel_mul_mm_q4_k_f32_l4_lm", &err), err));
         CL_CHECK(clReleaseProgram(prog));
+
+        const std::string specialized_compile_opts =
+            compile_opts + " -DBM=32 -DTN=4"
+                           " -DKERNEL_NAME=kernel_mul_mm_q4_k_f32_l4_lm_m32_n128";
+        cl_program specialized_prog =
+            build_program_from_source(backend_ctx, kernel_src.c_str(), specialized_compile_opts);
+
+        CL_CHECK((backend_ctx->kernel_mul_mm_q4_k_f32_l4_lm_m32_n128 = clCreateKernel(specialized_prog, "kernel_mul_mm_q4_k_f32_l4_lm_m32_n128", &err), err));
+        CL_CHECK(clReleaseProgram(specialized_prog));
         GGML_LOG_CONT(".");
     }
 
@@ -19357,8 +19367,14 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
                     break;
                 }
 
+                int bm = 64;
                 kernel = backend_ctx->kernel_mul_mm_q4_k_f32_l4_lm;
                 nth0 = 128; // calculated as (BM*BN)/(TM*TN)
+                if (ne01 == 32 && ne11 == 128) {
+                    bm = 32;
+                    kernel = backend_ctx->kernel_mul_mm_q4_k_f32_l4_lm_m32_n128;
+                    nth0 = 128;
+                }
 
                 int batch_stride_a = ne00*ne01;
                 int batch_stride_b = ne10*ne11;
@@ -19386,8 +19402,7 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
                 CL_CHECK(clSetKernelArg(kernel, 19, sizeof(int),      &r2));
                 CL_CHECK(clSetKernelArg(kernel, 20, sizeof(int),      &r3));
 
-                // 64 is block tile size BM and BN - change here when BM and BN in the kernel are changed.
-                size_t global_work_size[] = {(size_t)(CEIL_DIV(ne01, 64)*nth0), (size_t)(CEIL_DIV(ne11, 64)), (size_t)ne12*ne13};
+                size_t global_work_size[] = {(size_t)(CEIL_DIV(ne01, bm)*nth0), (size_t)(CEIL_DIV(ne11, 64)), (size_t)ne12*ne13};
                 size_t local_work_size[] = {(size_t)nth0, 1, 1};
 
                 backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, local_work_size, dst);
