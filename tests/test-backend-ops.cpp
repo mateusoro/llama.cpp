@@ -3939,6 +3939,45 @@ struct test_ssm_conv : public test_case {
     }
 };
 
+struct test_ssm_conv_split_input : public test_case {
+    const int64_t n_tokens;
+    const int64_t n_channels;
+    const int64_t n_seqs;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "SSM_CONV_SPLIT_INPUT";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    std::string vars() override {
+        return VARS_TO_STR3(n_tokens, n_channels, n_seqs);
+    }
+
+    test_ssm_conv_split_input(int64_t n_tokens, int64_t n_channels, int64_t n_seqs = 1)
+        : n_tokens(n_tokens), n_channels(n_channels), n_seqs(n_seqs) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * state = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 3, n_channels, n_seqs);
+        ggml_tensor * input_raw = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_channels, n_tokens, n_seqs);
+        ggml_tensor * input = ggml_transpose(ctx, input_raw);
+        ggml_tensor * weights = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 4, n_channels);
+
+        ggml_set_name(state, "state");
+        ggml_set_name(input_raw, "input_raw");
+        ggml_set_name(input, "input_transposed");
+        ggml_set_name(weights, "weights");
+
+        ggml_tensor * concat = ggml_concat(ctx, state, input, 0);
+        ggml_set_name(concat, "conv_input");
+
+        ggml_tensor * out = ggml_ssm_conv(ctx, concat, weights);
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
 // GGML_OP_SSM_CONV + GGML_OP_ADD (channel-wise bias, optional) + GGML_OP_UNARY(SILU) (fused operation)
 struct test_ssm_conv_bias_silu : public test_case {
     const ggml_type type;
@@ -8765,6 +8804,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             }
         }
     }
+    test_cases.emplace_back(new test_ssm_conv_bias_silu(GGML_TYPE_F32, {131, 8192, 1, 1}, {4, 8192, 1, 1}, false));
+    test_cases.emplace_back(new test_ssm_conv_split_input(128, 8192));
+    test_cases.emplace_back(new test_ssm_conv_split_input(1, 8192));
+    test_cases.emplace_back(new test_ssm_conv_split_input(2, 1024, 2));
 
     test_cases.emplace_back(new test_ssm_scan(GGML_TYPE_F32, 16, 1, 1024, 1, 32, 4)); // Mamba-1
     test_cases.emplace_back(new test_ssm_scan(GGML_TYPE_F32, 128, 64, 16, 2, 32, 4)); // Mamba-2
@@ -9973,6 +10016,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     test_cases.emplace_back(new test_ssm_conv(GGML_TYPE_F32, {4,   3328, 1, 1}, {4, 3328, 1, 1})); // generate
     test_cases.emplace_back(new test_ssm_conv_bias_silu(GGML_TYPE_F32, {515, 3328, 1, 1}, {4, 3328, 1, 1}, true));  // prefill
     test_cases.emplace_back(new test_ssm_conv_bias_silu(GGML_TYPE_F32, {4,   3328, 1, 1}, {4, 3328, 1, 1}, true));  // generate
+    test_cases.emplace_back(new test_ssm_conv_bias_silu(GGML_TYPE_F32, {131, 8192, 1, 1}, {4, 8192, 1, 1}, false)); // Agents-A1 prefill
+    test_cases.emplace_back(new test_ssm_conv_split_input(128, 8192)); // Agents-A1 prefill
+    test_cases.emplace_back(new test_ssm_conv_split_input(1, 8192));   // Agents-A1 generation
     test_cases.emplace_back(new test_ssm_scan(GGML_TYPE_F32, 128, 64, 48, 1, 512, 1)); // prefill
     test_cases.emplace_back(new test_ssm_scan(GGML_TYPE_F32, 128, 64, 48, 1, 1,   1)); // generate
 

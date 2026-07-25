@@ -5575,6 +5575,13 @@ struct ggml_tensor * ggml_ssm_conv(
     result->src[0] = sx;
     result->src[1] = c;
 
+    // Preserve the split inputs until SSM_CONV completes. Backends may consume
+    // a CONCAT directly without materializing its output.
+    if (sx->op == GGML_OP_CONCAT) {
+        result->src[2] = sx->src[0];
+        result->src[3] = sx->src[1];
+    }
+
     return result;
 }
 

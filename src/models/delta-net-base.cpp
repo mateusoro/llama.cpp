@@ -477,14 +477,25 @@ ggml_tensor * llm_build_delta_net_base::build_conv_state(
     const size_t row_size  = ggml_row_size(conv_states_all->type, row_count);
 
     if (cparams.n_rs_seq == 0) {
-        const int64_t s_idx  = conv_input->ne[0] - conv_states->ne[0];
         const int64_t s_slot = 0;
 
-        ggml_tensor * conv_state_last =
-            ggml_view_3d(ctx0, conv_input,
-                    conv_kernel_size - 1, conv_channels, n_seqs,
-                    conv_input->nb[1], conv_input->nb[2],
-                    ggml_row_size(conv_input->type, s_idx));
+        ggml_tensor * conv_state_last;
+        if (qkv_mixed->ne[0] >= conv_states->ne[0]) {
+            const int64_t s_idx = qkv_mixed->ne[0] - conv_states->ne[0];
+            conv_state_last =
+                ggml_view_3d(ctx0, qkv_mixed,
+                        conv_kernel_size - 1, conv_channels, n_seqs,
+                        qkv_mixed->nb[1], qkv_mixed->nb[2],
+                        s_idx * qkv_mixed->nb[0]);
+        } else {
+            const int64_t n_from_state = conv_states->ne[0] - qkv_mixed->ne[0];
+            ggml_tensor * conv_state_tail =
+                ggml_view_3d(ctx0, conv_states,
+                        n_from_state, conv_channels, n_seqs,
+                        conv_states->nb[1], conv_states->nb[2],
+                        qkv_mixed->ne[0] * conv_states->nb[0]);
+            conv_state_last = ggml_concat(ctx0, conv_state_tail, qkv_mixed, 0);
+        }
         cb(conv_state_last, "conv_state_last", il);
 
         ggml_tensor * conv_state_update =

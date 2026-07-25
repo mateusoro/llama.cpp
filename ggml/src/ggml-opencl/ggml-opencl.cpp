@@ -567,6 +567,8 @@ struct ggml_backend_opencl_context {
     bool has_integer_dot      = false;       // cl_khr_integer_dot_product or cl_qcom_dot_product8
     bool has_qcom_subgroup_shuffle = false;  // specifically cl_qcom_subgroup_shuffle
     bool disable_fusion;
+    bool disable_ssm_conv_silu_fusion;
+    bool ssm_conv_split_input;
 
     // ragged moe, use int to directly pass to kernel
     cl_uint  adreno_use_moe_ragged;
@@ -861,7 +863,7 @@ struct ggml_backend_opencl_context {
     cl_kernel kernel_conv_2d_f16;
     cl_kernel kernel_conv_2d_f32;
     cl_kernel kernel_conv_2d_f16_f32;
-    cl_kernel kernel_ssm_conv_f32_f32, kernel_ssm_conv_f32_f32_4;
+    cl_kernel kernel_ssm_conv_f32_f32, kernel_ssm_conv_f32_f32_4, kernel_ssm_conv_split_f32_f32_4;
     // [size_idx][kda][tgpp] where size_idx: 0=S_V=16, 1=32, 2=64, 3=128; kda: 0 or 1.
     // tgpp 0 = TG variant (COLS_PER_LANE_GROUP=1), tgpp 1 = prefill variant (COLS_PER_LANE_GROUP=4).
     cl_kernel kernel_gated_delta_net_f32[4][2][2] = {};
@@ -3159,6 +3161,8 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
 
         CL_CHECK((backend_ctx->kernel_ssm_conv_f32_f32   = clCreateKernel(prog, "kernel_ssm_conv_f32_f32", &err), err));
         CL_CHECK((backend_ctx->kernel_ssm_conv_f32_f32_4 = clCreateKernel(prog, "kernel_ssm_conv_f32_f32_4", &err), err));
+        CL_CHECK((backend_ctx->kernel_ssm_conv_split_f32_f32_4 =
+            clCreateKernel(prog, "kernel_ssm_conv_split_f32_f32_4", &err), err));
         CL_CHECK(clReleaseProgram(prog));
         GGML_LOG_CONT(".");
     }
@@ -6033,6 +6037,11 @@ static ggml_backend_opencl_context * ggml_cl_init(ggml_backend_dev_t dev) {
 #endif // GGML_OPENCL_USE_ADRENO_KERNELS
 
     backend_ctx->disable_fusion = getenv("GGML_OPENCL_DISABLE_FUSION") != nullptr;
+    backend_ctx->disable_ssm_conv_silu_fusion =
+        getenv("GGML_OPENCL_DISABLE_SSM_CONV_SILU_FUSION") != nullptr;
+    const char * ssm_conv_split_input = getenv("GGML_OPENCL_SSM_CONV_SPLIT_INPUT");
+    backend_ctx->ssm_conv_split_input =
+        ssm_conv_split_input != nullptr && atoi(ssm_conv_split_input) != 0;
 
     dev_ctx->backend_ctx = backend_ctx.release();
     return dev_ctx->backend_ctx;
@@ -6940,6 +6949,13 @@ static bool ggml_opencl_can_fuse(const struct ggml_cgraph * cgraph, int node_idx
         if (!ggml_is_contiguous(gn->src[0]) || !ggml_is_contiguous(w) || !ggml_is_contiguous(b)) {
             return false;
         }
+    } else if (ops.size() == 2 && ops.begin()[0] == GGML_OP_SSM_CONV && ops.begin()[1] == GGML_OP_UNARY) {
+        const ggml_tensor * conv = cgraph->nodes[node_idx];
+        const ggml_tensor * silu = cgraph->nodes[node_idx+1];
+
+        if (ggml_get_unary_op(silu) != GGML_UNARY_OP_SILU || conv->type != GGML_TYPE_F32 || silu->type != GGML_TYPE_F32) {
+            return false;
+        }
     }
 
     return true;
@@ -6948,6 +6964,54 @@ static bool ggml_opencl_can_fuse(const struct ggml_cgraph * cgraph, int node_idx
 static void ggml_opencl_op_rms_norm_fused(ggml_backend_t backend, ggml_tensor * rms_norm_tensor, ggml_tensor * mul_tensor);
 static void ggml_opencl_op_norm_fused(ggml_backend_t backend, ggml_tensor * norm_tensor, ggml_tensor * mul_tensor, ggml_tensor * add_tensor);
 static void ggml_opencl_op_group_norm_fused(ggml_backend_t backend, ggml_tensor * gn_tensor, ggml_tensor * mul_tensor, ggml_tensor * add_tensor);
+static void ggml_opencl_op_ssm_conv_silu_fused(ggml_backend_t backend, ggml_tensor * conv_tensor, ggml_tensor * silu_tensor);
+
+static bool ggml_opencl_ssm_conv_split_compatible(
+        const ggml_tensor * concat,
+        const ggml_tensor * weights,
+        const ggml_tensor * dst) {
+    if (!concat || concat->op != GGML_OP_CONCAT || !concat->src[0] || !concat->src[1] || !weights || !dst) {
+        return false;
+    }
+
+    const ggml_tensor * state = concat->src[0];
+    const ggml_tensor * input = concat->src[1];
+    const int32_t dim = ((const int32_t *) concat->op_params)[0];
+
+    return dst->src[2] == state && dst->src[3] == input &&
+        dim == 0 &&
+        state->type == GGML_TYPE_F32 && input->type == GGML_TYPE_F32 &&
+        concat->type == GGML_TYPE_F32 && weights->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32 &&
+        state->ne[0] == 3 && weights->ne[0] == 4 &&
+        concat->ne[0] == state->ne[0] + input->ne[0] &&
+        concat->ne[1] == state->ne[1] && concat->ne[1] == input->ne[1] &&
+        concat->ne[2] == state->ne[2] && concat->ne[2] == input->ne[2] &&
+        concat->ne[3] == state->ne[3] && concat->ne[3] == input->ne[3] &&
+        weights->ne[1] == concat->ne[1] &&
+        dst->ne[0] == concat->ne[1] && dst->ne[1] == input->ne[0] &&
+        dst->ne[2] == concat->ne[2] && dst->ne[3] == concat->ne[3];
+}
+
+static bool ggml_opencl_can_skip_ssm_conv_concat(const ggml_cgraph * cgraph, int node_idx) {
+    const ggml_tensor * concat = cgraph->nodes[node_idx];
+    if (concat->op != GGML_OP_CONCAT || !ggml_node_has_n_uses(cgraph, node_idx, 1) ||
+        (concat->flags & GGML_TENSOR_FLAG_OUTPUT) != 0) {
+        return false;
+    }
+
+    for (int i = node_idx + 1; i < cgraph->n_nodes; ++i) {
+        const ggml_tensor * consumer = cgraph->nodes[i];
+        for (int src_idx = 0; src_idx < GGML_MAX_SRC; ++src_idx) {
+            if (consumer->src[src_idx] != concat) {
+                continue;
+            }
+            return src_idx == 0 && consumer->op == GGML_OP_SSM_CONV &&
+                ggml_opencl_ssm_conv_split_compatible(concat, consumer->src[1], consumer);
+        }
+    }
+
+    return false;
+}
 
 static ggml_status ggml_backend_opencl_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
     ggml_backend_opencl_context *backend_ctx = (ggml_backend_opencl_context *)backend->context;
@@ -6965,6 +7029,11 @@ static ggml_status ggml_backend_opencl_graph_compute(ggml_backend_t backend, ggm
         }
 
         if ((node->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
+            continue;
+        }
+
+        if (backend_ctx->ssm_conv_split_input && node->op == GGML_OP_CONCAT &&
+            ggml_opencl_can_skip_ssm_conv_concat(cgraph, i)) {
             continue;
         }
 
@@ -6991,6 +7060,12 @@ static ggml_status ggml_backend_opencl_graph_compute(ggml_backend_t backend, ggm
 
         if (!backend_ctx->disable_fusion && ggml_opencl_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL })) {
             ggml_opencl_op_rms_norm_fused(backend, node, cgraph->nodes[i+1]);
+            i++;
+            continue;
+        }
+        if (!backend_ctx->disable_fusion && !backend_ctx->disable_ssm_conv_silu_fusion &&
+            ggml_opencl_can_fuse(cgraph, i, { GGML_OP_SSM_CONV, GGML_OP_UNARY })) {
+            ggml_opencl_op_ssm_conv_silu_fused(backend, node, cgraph->nodes[i+1]);
             i++;
             continue;
         }
@@ -12221,13 +12296,94 @@ static void ggml_cl_mean(ggml_backend_t backend, const ggml_tensor * src0, const
     backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, local_work_size, dst);
 }
 
-static void ggml_cl_ssm_conv(ggml_backend_t backend, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
+static bool ggml_cl_ssm_conv_split_impl(
+        ggml_backend_t backend,
+        const ggml_tensor * concat,
+        const ggml_tensor * weights,
+        ggml_tensor * dst,
+        bool apply_silu) {
+    ggml_backend_opencl_context * backend_ctx = (ggml_backend_opencl_context *) backend->context;
+    if (!backend_ctx->ssm_conv_split_input ||
+        !ggml_opencl_ssm_conv_split_compatible(concat, weights, dst)) {
+        return false;
+    }
+
+    const ggml_tensor * state = concat->src[0];
+    const ggml_tensor * input = concat->src[1];
+
+    GGML_ASSERT(state->extra);
+    GGML_ASSERT(input->extra);
+    GGML_ASSERT(weights->extra);
+    GGML_ASSERT(dst->extra);
+
+    ggml_tensor_extra_cl * extra_state   = (ggml_tensor_extra_cl *) state->extra;
+    ggml_tensor_extra_cl * extra_input   = (ggml_tensor_extra_cl *) input->extra;
+    ggml_tensor_extra_cl * extra_weights = (ggml_tensor_extra_cl *) weights->extra;
+    ggml_tensor_extra_cl * extra_dst     = (ggml_tensor_extra_cl *) dst->extra;
+
+    cl_ulong offset_state   = extra_state->offset   + state->view_offs;
+    cl_ulong offset_input   = extra_input->offset   + input->view_offs;
+    cl_ulong offset_weights = extra_weights->offset + weights->view_offs;
+    cl_ulong offset_dst     = extra_dst->offset     + dst->view_offs;
+
+    cl_ulong state_nb0 = state->nb[0];
+    cl_ulong state_nb1 = state->nb[1];
+    cl_ulong state_nb2 = state->nb[2];
+    cl_ulong input_nb0 = input->nb[0];
+    cl_ulong input_nb1 = input->nb[1];
+    cl_ulong input_nb2 = input->nb[2];
+    cl_int state_tokens = state->ne[0];
+    cl_ulong weights_nb1 = weights->nb[1];
+    cl_ulong dst_nb0 = dst->nb[0];
+    cl_ulong dst_nb1 = dst->nb[1];
+    cl_ulong dst_nb2 = dst->nb[2];
+    cl_int apply_silu_arg = apply_silu ? 1 : 0;
+
+    cl_kernel kernel = backend_ctx->kernel_ssm_conv_split_f32_f32_4;
+    int arg = 0;
+    CL_CHECK(clSetKernelArg(kernel, arg++, sizeof(cl_mem),   &extra_state->data_device));
+    CL_CHECK(clSetKernelArg(kernel, arg++, sizeof(cl_ulong), &offset_state));
+    CL_CHECK(clSetKernelArg(kernel, arg++, sizeof(cl_mem),   &extra_input->data_device));
+    CL_CHECK(clSetKernelArg(kernel, arg++, sizeof(cl_ulong), &offset_input));
+    CL_CHECK(clSetKernelArg(kernel, arg++, sizeof(cl_mem),   &extra_weights->data_device));
+    CL_CHECK(clSetKernelArg(kernel, arg++, sizeof(cl_ulong), &offset_weights));
+    CL_CHECK(clSetKernelArg(kernel, arg++, sizeof(cl_mem),   &extra_dst->data_device));
+    CL_CHECK(clSetKernelArg(kernel, arg++, sizeof(cl_ulong), &offset_dst));
+    CL_CHECK(clSetKernelArg(kernel, arg++, sizeof(cl_ulong), &state_nb0));
+    CL_CHECK(clSetKernelArg(kernel, arg++, sizeof(cl_ulong), &state_nb1));
+    CL_CHECK(clSetKernelArg(kernel, arg++, sizeof(cl_ulong), &state_nb2));
+    CL_CHECK(clSetKernelArg(kernel, arg++, sizeof(cl_ulong), &input_nb0));
+    CL_CHECK(clSetKernelArg(kernel, arg++, sizeof(cl_ulong), &input_nb1));
+    CL_CHECK(clSetKernelArg(kernel, arg++, sizeof(cl_ulong), &input_nb2));
+    CL_CHECK(clSetKernelArg(kernel, arg++, sizeof(cl_int),   &state_tokens));
+    CL_CHECK(clSetKernelArg(kernel, arg++, sizeof(cl_ulong), &weights_nb1));
+    CL_CHECK(clSetKernelArg(kernel, arg++, sizeof(cl_ulong), &dst_nb0));
+    CL_CHECK(clSetKernelArg(kernel, arg++, sizeof(cl_ulong), &dst_nb1));
+    CL_CHECK(clSetKernelArg(kernel, arg++, sizeof(cl_ulong), &dst_nb2));
+    CL_CHECK(clSetKernelArg(kernel, arg++, sizeof(cl_int),   &apply_silu_arg));
+
+    size_t global_work_size[] = {(size_t) concat->ne[1], (size_t) dst->ne[1], (size_t) dst->ne[2]};
+    size_t local_work_size[]  = {64, 1, 1};
+    size_t * local_work_size_ptr = local_work_size;
+    if (concat->ne[1] % 64 != 0 && !backend_ctx->non_uniform_workgroups) {
+        local_work_size_ptr = nullptr;
+    }
+
+    backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, local_work_size_ptr, dst);
+    return true;
+}
+
+static void ggml_cl_ssm_conv_impl(ggml_backend_t backend, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst, bool apply_silu) {
     GGML_ASSERT(src0);
     GGML_ASSERT(src0->extra);
     GGML_ASSERT(src1);
     GGML_ASSERT(src1->extra);
     GGML_ASSERT(dst);
     GGML_ASSERT(dst->extra);
+
+    if (ggml_cl_ssm_conv_split_impl(backend, src0, src1, dst, apply_silu)) {
+        return;
+    }
 
     ggml_backend_opencl_context *backend_ctx = (ggml_backend_opencl_context *)backend->context;
 
@@ -12252,6 +12408,7 @@ static void ggml_cl_ssm_conv(ggml_backend_t backend, const ggml_tensor * src0, c
     cl_ulong nb0 = dst->nb[0];
     cl_ulong nb1 = dst->nb[1];
     cl_ulong nb2 = dst->nb[2];
+    cl_int apply_silu_arg = apply_silu ? 1 : 0;
 
     cl_kernel kernel = backend_ctx->kernel_ssm_conv_f32_f32;
 
@@ -12273,6 +12430,7 @@ static void ggml_cl_ssm_conv(ggml_backend_t backend, const ggml_tensor * src0, c
     CL_CHECK(clSetKernelArg(kernel, 11, sizeof(cl_ulong), &nb0));
     CL_CHECK(clSetKernelArg(kernel, 12, sizeof(cl_ulong), &nb1));
     CL_CHECK(clSetKernelArg(kernel, 13, sizeof(cl_ulong), &nb2));
+    CL_CHECK(clSetKernelArg(kernel, 14, sizeof(cl_int),   &apply_silu_arg));
 
     size_t global_work_size[] = {(size_t)ne01, (size_t)ne1, (size_t)ne2};
     size_t local_work_size[]  = {64, 1, 1};
@@ -12283,6 +12441,16 @@ static void ggml_cl_ssm_conv(ggml_backend_t backend, const ggml_tensor * src0, c
     }
 
     backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, local_work_size_ptr, dst);
+}
+
+static void ggml_cl_ssm_conv(ggml_backend_t backend, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
+    ggml_cl_ssm_conv_impl(backend, src0, src1, dst, false);
+}
+
+static void ggml_opencl_op_ssm_conv_silu_fused(ggml_backend_t backend, ggml_tensor * conv_tensor, ggml_tensor * silu_tensor) {
+    GGML_ASSERT(conv_tensor);
+    GGML_ASSERT(silu_tensor);
+    ggml_cl_ssm_conv_impl(backend, conv_tensor->src[0], conv_tensor->src[1], silu_tensor, true);
 }
 
 static void ggml_cl_gelu(ggml_backend_t backend, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
