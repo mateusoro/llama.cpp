@@ -105,6 +105,7 @@ jobs:
             -DGGML_OPENCL_EMBED_KERNELS=ON \
             -DGGML_OPENCL_PROFILING=OFF \
             -DGGML_RPC=OFF \
+            -DMTMD_VIDEO=OFF \
             -DLLAMA_BUILD_BORINGSSL=ON \
             -DLLAMA_BUILD_EXAMPLES=OFF \
             -DLLAMA_BUILD_TESTS=OFF \
