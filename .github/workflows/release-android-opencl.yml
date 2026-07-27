@@ -1,0 +1,209 @@
+name: Release (Android arm64 OpenCL)
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - master
+    tags:
+      - 'android-opencl-*'
+    paths:
+      - '.github/workflows/release-android-opencl.yml'
+      - '**/CMakeLists.txt'
+      - '**/*.cmake'
+      - '**/*.h'
+      - '**/*.hpp'
+      - '**/*.c'
+      - '**/*.cpp'
+      - '**/*.cl'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: android-opencl-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  NDK_VERSION: '29.0.14206865'
+  ANDROID_API: '28'
+  OPENCL_HEADERS_REVISION: 'a98488062f50c77c3e2edaf9c4f8dca7c41781ec'
+  OPENCL_LOADER_REVISION: '18fdcd58286376124f938948aa8ed156079c1c16'
+
+jobs:
+  android-arm64-opencl:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: Clone llama.cpp
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          lfs: false
+
+      - name: Set up JDK
+        uses: actions/setup-java@v5
+        with:
+          java-version: 17
+          distribution: temurin
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@40fd30fb8d7440372e1316f5d1809ec01dcd3699 # v4.0.1
+        with:
+          log-accepted-android-sdk-licenses: false
+
+      - name: Install NDK and build tools
+        run: |
+          sdkmanager "ndk;${NDK_VERSION}"
+          echo "ANDROID_NDK=${ANDROID_SDK_ROOT}/ndk/${NDK_VERSION}" >> "$GITHUB_ENV"
+          sudo apt-get update
+          sudo apt-get install -y ninja-build
+
+      - name: Fetch pinned OpenCL dependencies
+        run: |
+          git clone --filter=blob:none https://github.com/KhronosGroup/OpenCL-Headers.git deps/OpenCL-Headers
+          git -C deps/OpenCL-Headers checkout "${OPENCL_HEADERS_REVISION}"
+          git clone --filter=blob:none https://github.com/KhronosGroup/OpenCL-ICD-Loader.git deps/OpenCL-ICD-Loader
+          git -C deps/OpenCL-ICD-Loader checkout "${OPENCL_LOADER_REVISION}"
+
+      - name: Build Android OpenCL ICD loader
+        run: |
+          cmake \
+            -S deps/OpenCL-ICD-Loader \
+            -B build-opencl-loader \
+            -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_TOOLCHAIN_FILE="${ANDROID_NDK}/build/cmake/android.toolchain.cmake" \
+            -DANDROID_ABI=arm64-v8a \
+            -DANDROID_PLATFORM="android-${ANDROID_API}" \
+            -DCMAKE_INSTALL_PREFIX="${GITHUB_WORKSPACE}/runtime" \
+            -DOPENCL_ICD_LOADER_HEADERS_DIR="${GITHUB_WORKSPACE}/deps/OpenCL-Headers" \
+            -DBUILD_TESTING=OFF
+          cmake --build build-opencl-loader --target OpenCL --parallel "$(nproc)"
+          cmake --install build-opencl-loader
+
+          test -e runtime/lib/libOpenCL.so
+          test -e runtime/lib/libOpenCL.so.1
+
+      - name: Build llama.cpp for Android arm64 with OpenCL
+        run: |
+          cmake \
+            -S . \
+            -B build-android-opencl \
+            -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_TOOLCHAIN_FILE="${ANDROID_NDK}/build/cmake/android.toolchain.cmake" \
+            -DANDROID_ABI=arm64-v8a \
+            -DANDROID_PLATFORM="android-${ANDROID_API}" \
+            -DCMAKE_INSTALL_RPATH='$ORIGIN' \
+            -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON \
+            -DBUILD_SHARED_LIBS=OFF \
+            -DGGML_NATIVE=OFF \
+            -DGGML_OPENMP=OFF \
+            -DGGML_OPENCL=ON \
+            -DGGML_OPENCL_USE_ADRENO_KERNELS=ON \
+            -DGGML_OPENCL_EMBED_KERNELS=ON \
+            -DGGML_OPENCL_PROFILING=OFF \
+            -DGGML_RPC=OFF \
+            -DLLAMA_BUILD_BORINGSSL=ON \
+            -DLLAMA_BUILD_EXAMPLES=OFF \
+            -DLLAMA_BUILD_TESTS=OFF \
+            -DLLAMA_BUILD_TOOLS=ON \
+            -DLLAMA_BUILD_SERVER=ON \
+            -DLLAMA_BUILD_UI=OFF \
+            -DOpenCL_INCLUDE_DIR="${GITHUB_WORKSPACE}/deps/OpenCL-Headers" \
+            -DOpenCL_LIBRARY="${GITHUB_WORKSPACE}/runtime/lib/libOpenCL.so"
+          cmake --build build-android-opencl \
+            --target llama-server llama-bench \
+            --parallel "$(nproc)"
+
+      - name: Verify Android OpenCL binaries
+        run: |
+          test -x build-android-opencl/bin/llama-server
+          test -x build-android-opencl/bin/llama-bench
+
+          file build-android-opencl/bin/llama-server | tee server-file.txt
+          grep -q 'ARM aarch64' server-file.txt
+
+          "${ANDROID_NDK}/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-readelf" \
+            -d build-android-opencl/bin/llama-server \
+            | tee server-dynamic.txt
+          grep -q 'libOpenCL.so.1' server-dynamic.txt
+
+      - name: Pack release artifact
+        id: package
+        shell: bash
+        run: |
+          if [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
+            version="${GITHUB_REF_NAME}"
+          else
+            version="build-${GITHUB_RUN_NUMBER}-${GITHUB_SHA::8}"
+          fi
+
+          package_name="llama-${version}-bin-android-arm64-opencl"
+          package_dir="dist/${package_name}"
+          mkdir -p \
+            "${package_dir}/bin" \
+            "${package_dir}/lib" \
+            "${package_dir}/etc/OpenCL/vendors"
+
+          cp \
+            build-android-opencl/bin/llama-server \
+            build-android-opencl/bin/llama-bench \
+            "${package_dir}/bin/"
+          cp -a runtime/lib/libOpenCL.so* "${package_dir}/lib/"
+          printf '%s\n' /vendor/lib64/libOpenCL_adreno.so \
+            > "${package_dir}/etc/OpenCL/vendors/qualcomm.icd"
+          cp LICENSE "${package_dir}/"
+
+          {
+            echo "repository=${GITHUB_REPOSITORY}"
+            echo "revision=${GITHUB_SHA}"
+            echo "android_abi=arm64-v8a"
+            echo "android_api=${ANDROID_API}"
+            echo "backend=OpenCL"
+            echo "adreno_kernels=ON"
+            echo "opencl_headers=${OPENCL_HEADERS_REVISION}"
+            echo "opencl_loader=${OPENCL_LOADER_REVISION}"
+          } > "${package_dir}/BUILD_INFO.txt"
+
+          (
+            cd "${package_dir}"
+            sha256sum \
+              bin/llama-server \
+              bin/llama-bench \
+              lib/libOpenCL.so.1 \
+              > SHA256SUMS
+          )
+
+          archive="${package_name}.tar.gz"
+          tar -C dist -czf "${archive}" "${package_name}"
+          sha256sum "${archive}" > "${archive}.sha256"
+
+          echo "archive=${archive}" >> "$GITHUB_OUTPUT"
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v6
+        with:
+          name: llama-bin-android-arm64-opencl
+          path: |
+            ${{ steps.package.outputs.archive }}
+            ${{ steps.package.outputs.archive }}.sha256
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Create GitHub release
+        if: ${{ github.ref_type == 'tag' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ARCHIVE: ${{ steps.package.outputs.archive }}
+          VERSION: ${{ steps.package.outputs.version }}
+        run: |
+          gh release create "${VERSION}" \
+            "${ARCHIVE}" \
+            "${ARCHIVE}.sha256" \
+            --target "${GITHUB_SHA}" \
+            --title "llama.cpp Android arm64 OpenCL ${VERSION}" \
+            --notes "Android arm64 build of mateusoro/llama.cpp with the OpenCL backend, embedded Adreno kernels, llama-server, llama-bench, and the Khronos ICD loader. Runtime vendor ICD: /vendor/lib64/libOpenCL_adreno.so."
