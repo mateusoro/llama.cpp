@@ -1205,7 +1205,13 @@ cleanup:
 
   // Set working directory
   if (process_cwd) {
-#if defined(__APPLE__) && MAC_OS_X_VERSION_MIN_REQUIRED >= 260000
+#if defined(__ANDROID__)
+    // Android's posix_spawn.h does not expose an addchdir file action.
+    // subprocess_create() always passes a null process_cwd, so regular process
+    // spawning remains available while the unsupported extended case fails
+    // explicitly instead of preventing the whole server from compiling.
+    posix_error = ENOTSUP;
+#elif defined(__APPLE__) && MAC_OS_X_VERSION_MIN_REQUIRED >= 260000
     posix_error = posix_spawn_file_actions_addchdir(&actions, process_cwd);
 #else
 #if defined(__APPLE__) && defined(__clang__)
