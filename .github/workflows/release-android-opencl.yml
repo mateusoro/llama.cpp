@@ -81,10 +81,9 @@ jobs:
             -DOPENCL_ICD_LOADER_HEADERS_DIR="${GITHUB_WORKSPACE}/deps/OpenCL-Headers" \
             -DBUILD_TESTING=OFF
           cmake --build build-opencl-loader --target OpenCL --parallel "$(nproc)"
-          cmake --install build-opencl-loader
-
+          mkdir -p runtime/lib
+          cp -a build-opencl-loader/libOpenCL.so* runtime/lib/
           test -e runtime/lib/libOpenCL.so
-          test -e runtime/lib/libOpenCL.so.1
 
       - name: Build llama.cpp for Android arm64 with OpenCL
         run: |
@@ -129,7 +128,7 @@ jobs:
           "${ANDROID_NDK}/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-readelf" \
             -d build-android-opencl/bin/llama-server \
             | tee server-dynamic.txt
-          grep -q 'libOpenCL.so.1' server-dynamic.txt
+          grep -Eq 'libOpenCL\.so(\.1)?' server-dynamic.txt
 
       - name: Pack release artifact
         id: package
@@ -173,7 +172,7 @@ jobs:
             sha256sum \
               bin/llama-server \
               bin/llama-bench \
-              lib/libOpenCL.so.1 \
+              lib/libOpenCL.so \
               > SHA256SUMS
           )
 
